@@ -1,229 +1,303 @@
-import pygame
+import cv2
+import numpy as np
 import random
 import math
+from collections import deque
+from dataclasses import dataclass
 
-pygame.init()
-win = pygame.display.set_mode((600, 700))
-pygame.display.set_caption("PyShooter")
-clock = pygame.time.Clock()
-run = True
+WIDTH, HEIGHT = 600, 700
+GRID_COLS, GRID_ROWS = 15, 12    
+GRID_ORIGIN_X, GRID_ORIGIN_Y = 20, 20
+GRID_STEP = 40
+BALL_R = 20
+PLAY_Y = 600                   
+FPS = 60
 
-player_balls = []
-balls = []
-colors = [(255,0,0), (0,255,0), (0,0,255)]
-temp = []
+COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
 
-score = 0
-moves = 40
-restart_btn = pygame.Rect(200, 400, 150, 75)
+BALL_IMAGES = {
+    (255, 0, 0): cv2.imread("assets/red.png", cv2.IMREAD_UNCHANGED),
+    (0, 255, 0): cv2.imread("assets/green.png", cv2.IMREAD_UNCHANGED),
+    (0, 0, 255): cv2.imread("assets/blue.png", cv2.IMREAD_UNCHANGED),
+}
 
-game_state = 2
+GROUP_BASE_SCORE = 10
+GROUP_BONUS_PER_EXTRA = 20
+ORPHAN_SCORE = 5
 
-# 0->Start_Menu, 1->GameOver_Menu, 2->In_Game
+PROJECTILE_SPEED = 9
 
-class Ball():
-    def __init__(self, x, y, color, Type):
-        self.x = x
-        self.y = y
-        self.color = color
-        self.x_vel = 0
-        self.y_vel = 0
-        self.Type = Type
-        
-    def draw(self):
-        pygame.draw.circle(win, self.color, (self.x, self.y), 20)
-    
-    def move(self):
-        self.x += self.x_vel
-        self.y += self.y_vel
-        
-    def shoot(self):
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        print(mouse_x, mouse_y)
-        if mouse_y <= 600:
-            dx = mouse_x - 300
-            dy = 600 - mouse_y
-            try:
-                angle = math.atan(dx/dy)
-                x_vel = 5 * math.sin(angle)
-                y_vel = 5 * math.cos(angle)
-                print(angle, x_vel, y_vel)
-                self.x_vel, self.y_vel = x_vel, (y_vel)*-1
-            except:
-                print("error")
-                
-                
-                
-def startGame():
-    global player_balls, balls, score, moves, temp
-    player_balls = []
-    temp = []
-    score, moves = 0, 40
-    player_balls.append(Ball(300, 600, colors[random.randrange(0,3)], 0))
-    player_balls.append(Ball(300, 600, colors[random.randrange(0,3)], 0))
-    balls = []
-    for i in range(20, 620, 40):
-        for j in range(20, 300, 40):
-            balls.append(Ball(i, j, colors[random.randrange(0, 3)], 0))
-        
-        
-def drawBoard():
-    global player_balls
-    global balls
-    player_balls[0].draw()
-    pygame.draw.circle(win, player_balls[1].color, (300, 650), 20)
-    for ball in balls:
-        ball.draw()
-    
-def movePlayer():
-    global player_balls
-    global balls
-    global temp
-    global score
-    player_balls[0].move()
-    
-    if (player_balls[0].x <= 20) or (player_balls[0].x >= 580):
-        player_balls[0].x_vel = player_balls[0].x_vel * -1
-    if (player_balls[0].y <= 20):
-        player_balls[0].x_vel = 0
-        player_balls[0].y_vel = 0
-        balls.append(player_balls[0])
-        player_balls.remove(player_balls[0])
-        player_balls.append(Ball(300, 600, colors[random.randrange(0, 3)], 0))
-    
-    for ball in balls:
-        dx = player_balls[0].x - ball.x
-        dy = player_balls[0].y - ball.y
-        hypot = math.sqrt(dx*dx + dy*dy)
-        if hypot < 40:
-            player_balls[0].x_vel = 0
-            player_balls[0].y_vel = 0
-            balls.append(player_balls[0])
-            removeBalls(player_balls[0])
-            score += len(temp) * 5 + int(len(temp)*len(temp)/5)
-            print(score)
-            if len(temp) >= 3:
-                for l in temp:
-                    try:
-                        balls.remove(l)
-                    except:
-                        pass
-            temp = []
-            player_balls.remove(player_balls[0])
-            player_balls.append(Ball(300, 600, colors[random.randrange(0, 3)], 0))
-            remove()
-            break
-        
-        
-def removeBalls(Ball):
-    global balls
-    global temp
-    for ball in balls:
-        dx = Ball.x - ball.x
-        dy = Ball.y - ball.y
-        hypot = math.sqrt(dx * dx + dy * dy)
-        
-        if hypot != 0:
-            if hypot < 50 and ball.color == Ball.color:
-                k = False
-                for i in temp:
-                    if i == ball:
-                        k = True
+
+def clamp(v: int | float, lo: int | float, hi: int | float):
+    return max(lo, min(hi, v))
+
+
+def neighbors4(gx: int, gy: int):
+    """4-connected neighbourhood (grid-wise)."""
+    return (
+        (gx + 1, gy),
+        (gx - 1, gy),
+        (gx, gy + 1),
+        (gx, gy - 1),
+    )
+
+
+def neighbors8(gx: int, gy: int):
+    """8-connected neighbourhood (used for collision grouping)."""
+    return (
+        (gx + 1, gy), (gx - 1, gy), (gx, gy + 1), (gx, gy - 1),
+        (gx + 1, gy + 1), (gx - 1, gy + 1), (gx + 1, gy - 1), (gx - 1, gy - 1)
+    )
+
+
+def grid_to_pixel(gx: int, gy: int):
+    return GRID_ORIGIN_X + gx * GRID_STEP, GRID_ORIGIN_Y + gy * GRID_STEP
+
+
+@dataclass
+class Ball:
+    x: float
+    y: float
+    color: tuple[int, int, int]
+    vx: float = 0.0
+    vy: float = 0.0
+    moving: bool = True
+
+    def update(self):
+        if not self.moving:
+            return
+        self.x += self.vx
+        self.y += self.vy
+        if self.x <= BALL_R or self.x >= WIDTH - BALL_R:
+            self.vx *= -1
+            self.x = clamp(self.x, BALL_R, WIDTH - BALL_R)
+
+    def draw(self, frame):
+        img = BALL_IMAGES.get(self.color)
+        if img is None:
+            return
+
+        h, w = img.shape[:2]
+        x, y = int(self.x - w / 2), int(self.y - h / 2)
+
+        if img.shape[2] == 4:
+        # Альфа-наложение
+            overlay_image_alpha(frame, img[:, :, :3], (x, y), img[:, :, 3])
+        else:
+            frame[y:y + h, x:x + w] = img
+
+
+    def grid_pos(self):
+        gx = int(round((self.x - GRID_ORIGIN_X) / GRID_STEP))
+        gy = int(round((self.y - GRID_ORIGIN_Y) / GRID_STEP))
+        return gx, gy
+
+def overlay_image_alpha(img, img_overlay, pos, alpha_mask):
+    x, y = pos
+    h, w = img_overlay.shape[:2]
+
+    if x < 0 or y < 0 or x + w > img.shape[1] or y + h > img.shape[0]:
+        return  # Skip out-of-bounds
+
+    roi = img[y:y + h, x:x + w]
+
+    alpha = alpha_mask / 255.0
+    for c in range(3):
+        roi[:, :, c] = roi[:, :, c] * (1.0 - alpha) + img_overlay[:, :, c] * alpha
+
+class Game:
+    def __init__(self):
+        self.reset()
+
+    def aim(self, mx: int, my: int):
+        self.aim_x, self.aim_y = mx, my
+
+    def launch_and_shoot(self):
+        """Creates the player ball and immediately assigns its velocity."""
+        if self.state != "play" or self.player_ball is not None or self.moves == 0:
+            return
+        self.player_ball = Ball(WIDTH // 2, PLAY_Y, self.next_ball_color, moving=True)
+        self.next_ball_color = random.choice(COLORS)
+
+        dx, dy = self.aim_x - WIDTH // 2, self.aim_y - PLAY_Y
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+
+            dx, dy = 0, -1
+            length = 1
+        self.player_ball.vx = PROJECTILE_SPEED * dx / length
+        self.player_ball.vy = PROJECTILE_SPEED * dy / length
+
+    def reset(self):
+        self.grid: dict[tuple[int, int], Ball] = {}
+  
+        for gx in range(GRID_COLS):
+            for gy in range(7):
+                px, py = grid_to_pixel(gx, gy)
+                self.grid[(gx, gy)] = Ball(px, py, random.choice(COLORS), moving=False)
+        self.player_ball: Ball | None = None
+        self.next_ball_color = random.choice(COLORS)
+        self.moves = 40
+        self.score = 0
+        self.state = "play" 
+        self.aim_x, self.aim_y = WIDTH // 2, PLAY_Y - 100
+
+    def update(self):
+        if self.state != "play":
+            return
+
+        if self.player_ball is not None:
+            self.player_ball.update()
+          
+            if self.player_ball.y <= BALL_R:
+                self._stick_player()
+            else:
+               
+                for b in self.grid.values():
+                    if (self.player_ball.x - b.x) ** 2 + (self.player_ball.y - b.y) ** 2 <= (2 * BALL_R) ** 2:
+                        self._stick_player()
                         break
-                if not k:
-                    temp.append(ball)
-                    removeBalls(ball)
-                    
-def remove():
-    global balls
-    List = []
-    for b in balls:
-        List.append([b,0])
-        
-    def func(ball):
-        for j in List:
-            if j[1] == 0:
-                dx = ball.x - j[0].x
-                dy = ball.y - j[0].y
-                hypot = math.sqrt(dx*dx + dy*dy)
-                if hypot != 0 and hypot <= 50:
-                    j[1] = 1
-                    func(j[0])
-    
-    for i in List:
-        if i[1] == 0:
-            bx, by = i[0].x, i[0].y
-            in_edge = (bx <= 25 or bx >= 570) or (by <= 25 or by >= 570)
-            if in_edge:
-                i[1] = 1
-                func(i[0])
-    for k in List:
-        if k[1] == 0:
-            if k[0].Type == 0:
-                balls.remove(k[0])
-                
 
-def drawUI():
-    global moves, score
-    pygame.draw.line(win, (255, 255, 255), (300, 600), pygame.mouse.get_pos())
-    x, y = pygame.mouse.get_pos()
-    pygame.draw.line(win, (255, 255, 255), (320, 600), (x+20, y))
-    pygame.draw.line(win, (255, 255, 255), (280, 600), (x-20, y))
-    main_font = pygame.font.SysFont("comicsans", 50)
-    win.blit(main_font.render(f"Moves: {moves}", 1, (255,255,255)), (50, 625))
-    win.blit(main_font.render(f"Score: {score}", 1, (255,255,255)), (320, 625))
     
-def game():
-    global balls, moves, game_state
-    for ball in balls:
-        ball.move()
-        if (ball.x <= 20) or (ball.x >= 580):
-            ball.x_vel = ball.x_vel * -1
-    if len(balls) == 0:
-        game_state = 1
-    if moves <= -1:
-        game_state = 1
-    for ball in balls:
-        if ball.y >= 440:
-            game_state = 1
+        if not self.grid:
+            self.state = "win"
+        elif self.moves == 0 and self.player_ball is None:
+            self.state = "over"
+
+    def draw(self, frame):
+        for b in self.grid.values():
+            b.draw(frame)
+        if self.player_ball is not None:
+            self.player_ball.draw(frame)
+        cv2.circle(frame, (WIDTH // 2, PLAY_Y + 50), BALL_R, self.next_ball_color, -1)
+        cv2.line(frame, (WIDTH // 2, PLAY_Y), (self.aim_x, self.aim_y), (200, 200, 200), 1) # изменение состояния игры. 
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(frame, f"Score: {self.score}", (20, 645), font, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"Moves: {self.moves}", (320, 645), font, 0.8, (255, 255, 255), 2)
+        if self.state == "win":
+            cv2.putText(frame, "YOU WIN!", (200, 300), font, 1.2, (0, 255, 0), 3)
+            cv2.putText(frame, "Press ENTER to play again", (90, 350), font, 0.8, (0, 255, 0), 2)
+        elif self.state == "over":
+            cv2.putText(frame, "GAME OVER", (190, 300), font, 1.2, (0, 0, 255), 3)
+            cv2.putText(frame, "Press ENTER to restart", (100, 350), font, 0.8, (0, 0, 255), 2)
+
+    def _stick_player(self):
+        """Snap the projectile onto the grid and resolve the board state."""
+        if self.player_ball is None:
+            return
+        gx, gy = self.player_ball.grid_pos()
+        gx = clamp(gx, 0, GRID_COLS - 1)
+        gy = clamp(gy, 0, GRID_ROWS - 1)
+
+        if (gx, gy) in self.grid:
+            search_queue = deque([(gx, gy, 0)])
+            visited = {(gx, gy)}
+            while search_queue:
+                x, y, dist = search_queue.popleft()
+                for nx, ny in neighbors4(x, y):
+                    if 0 <= nx < GRID_COLS and 0 <= ny < GRID_ROWS and (nx, ny) not in visited:
+                        if (nx, ny) not in self.grid:
+                            gx, gy = nx, ny
+                            search_queue.clear()
+                            break
+                        visited.add((nx, ny))
+                        search_queue.append((nx, ny, dist + 1))
+
+        self.player_ball.x, self.player_ball.y = grid_to_pixel(gx, gy)
+        self.player_ball.vx = self.player_ball.vy = 0.0
+        self.player_ball.moving = False
+        self.grid[(gx, gy)] = self.player_ball
+        self.player_ball = None
+        self.moves -= 1
+
+        self._resolve_matches((gx, gy))
+
+    def _resolve_matches(self, start: tuple[int, int]):
+        color = self.grid[start].color
+        group = self._collect_same_color(start, color)
+        if len(group) >= 3:
+            for pos in group:
+                self.grid.pop(pos, None)
+            
+            self.score += GROUP_BASE_SCORE * len(group)
+            if len(group) > 3:
+                self.score += GROUP_BONUS_PER_EXTRA * (len(group) - 3)
+            
+            orphan_count = self._drop_orphans()
+            self.score += orphan_count * ORPHAN_SCORE
+
+    def _collect_same_color(self, start: tuple[int, int], color):
+        visited = set()
+        dq = deque([start])
+        result = []
+        while dq:
+            pos = dq.popleft()
+            if pos in visited:
+                continue
+            visited.add(pos)
+            b = self.grid.get(pos)
+            if b is None or b.color != color:
+                continue
+            result.append(pos)
+            for n in neighbors4(*pos):
+                if 0 <= n[0] < GRID_COLS and 0 <= n[1] < GRID_ROWS:
+                    dq.append(n)
+        return result
+
+    def _drop_orphans(self):
+        """Remove balls not connected to the ceiling (row 0). Returns count."""
+        if not self.grid:
+            return 0
+        connected = set()
+        dq = deque([p for p in self.grid if p[1] == 0])
+        while dq:
+            pos = dq.popleft()
+            if pos in connected:
+                continue
+            connected.add(pos)
+            for n in neighbors4(*pos):
+                if n in self.grid and n not in connected:
+                    dq.append(n)
+       
+        orphan_positions = [p for p in self.grid if p not in connected]
+        for p in orphan_positions:
+            self.grid.pop(p, None)
+        return len(orphan_positions)
+
+
+
+def main():
+    background = cv2.imread("assets/background.jpg")
+    background = cv2.resize(background, (WIDTH, HEIGHT)) 
+
+    game = Game()
+    cv2.namedWindow("PyShooter")
+
+    def mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            game.aim(x, y)
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            game.aim(x, y)
+            game.launch_and_shoot()
+
+    cv2.setMouseCallback("PyShooter", mouse)
+
+    delay_ms = int(1000 / FPS)
+    while True:
+        frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        frame[:] = background 
+        game.update()
+        game.draw(frame)
+        cv2.imshow("PyShooter", frame)
+
+        key = cv2.waitKey(delay_ms) & 0xFF
+        if key == 27:  # ESC
             break
+        elif key == 13 and game.state in ("win", "over"): 
+            game.reset() 
 
-startGame()
-while run:
-    clock.tick(60)
-    if game_state == 2:
-        win.fill((0,0,0))
-        pygame.draw.line(win, (255,255,255), (0, 600), (600, 600))
-        drawBoard()
-        movePlayer()
-        drawUI()
-        game()
-        pygame.display.update()
-        
-    if game_state == 1:
-        win.fill((0,0,0))
-        main_font = pygame.font.SysFont("comicsans", 50)
-        score_label = main_font.render(f"Score: {score}", 1, (255,255,255))
-        l1_label = main_font.render("GameOver!!!", 1, (255,0,0))
-        win.blit(score_label, (230,200))
-        win.blit(l1_label, (200,100))
-        win.blit(main_font.render("Restart", 1, (0,0,255)), (235, 400))
-        pygame.display.update()
-        
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            run = False
-            pygame.quit()
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            if game_state == 2:
-                if player_balls[0].x_vel == 0 and player_balls[0].y_vel == 0:
-                    player_balls[0].shoot()
-                    moves -= 1
-            if game_state == 1:
-                if restart_btn.collidepoint(pygame.mouse.get_pos()):
-                    game_state = 2
-                    startGame()
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_SPACE:
-                if game_state == 2:
-                    player_balls[0], player_balls[1] = player_balls[1], player_balls[0]
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

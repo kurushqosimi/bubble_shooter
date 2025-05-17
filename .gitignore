@@ -1,2 +1,4 @@
 .spyproject
 myenv
+__pycache__/
+3_task.cpp
